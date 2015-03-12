@@ -144,6 +144,7 @@ Malformed CSV (column list line not at top of file)
 			{
 			new Ajax.Updater('csvds_filelist','ajax_pluginconf.php',{
 			parameters:{file:'csvds_filelist.php',
+						token: '<?php echo $_SESSION["token"]; ?>',
 						plugintype:'datasources',
 					    pluginclass:'<?php echo get_class($this->_plugin)?>',
 					    profile:'<?php echo $this->getConfig()->getProfile()?>',

@@ -8,6 +8,7 @@ require_once ("../engines/magmi_utilityengine.php");
 	updatePanel=function(pclass,pparams)
 	{
 		params={
+			token: '<?php echo $_SESSION["token"]; ?>',
 			engine:'magmi_utilityengine:Magmi_UtilityEngine',
 			pluginclass:pclass,
 			plugintype:'utilities',
