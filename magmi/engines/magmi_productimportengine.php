@@ -8,7 +8,7 @@
  * updated : 2010-10-09
  *
  */
-
+require_once(dirname(__DIR__)."/inc/magmi_defs.php");
 /* use external file for db helper */
 require_once ("magmi_engine.php");
 require_once ("magmi_valueparser.php");
@@ -52,9 +52,7 @@ class Magmi_ProductImportEngine extends Magmi_Engine
     private $_dstore = array();
     //same flag if current import line is referencing same item than the previous one
     private $_same;
-    //current product id
-    private $_currentpid;
-    //extra attributes to create 
+    //extra attributes to create
     private $_extra_attrs;
     //current import profile
     private $_profile;
@@ -68,20 +66,19 @@ class Magmi_ProductImportEngine extends Magmi_Engine
     private $_stockcols = array();
     //stats 
     private $_skustats = array();
+    //handlers cache
+    private  $_handlercache=array();
 
-    
     /**
-     * constructor
-     *
-     * @param string $conffile
-     *            : configuration .ini filename
+     * Constructor
+     * add default attribute processor
      */
     public function __construct()
     {
         parent::__construct();
         $this->setBuiltinPluginClasses("itemprocessors", 
-            dirname(dirname(__FILE__)) .
-                 "/plugins/inc/magmi_defaultattributehandler.php::Magmi_DefaultAttributeItemProcessor");
+            MAGMI_PLUGIN_DIR .
+            '/inc/magmi_defaultattributehandler.php::Magmi_DefaultAttributeItemProcessor');
     }
 
     public function getSkuStats()
@@ -96,7 +93,7 @@ class Magmi_ProductImportEngine extends Magmi_Engine
      */
     public function getEngineInfo()
     {
-        return array("name"=>"Magmi Product Import Engine","version"=>"1.8.2","author"=>"dweeves");
+        return array("name"=>"Magmi Product Import Engine","version"=>"1.9.1","author"=>"dweeves");
     }
 
     /**
@@ -259,7 +256,7 @@ class Magmi_ProductImportEngine extends Magmi_Engine
     }
 
     /**
-     * returns mode
+     * returns execution mode
      */
     public function getMode()
     {
@@ -334,6 +331,19 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         return $required;
     }
 
+    public function checkAttributeInfo($attrinf)
+    {
+        $smodel=$attrinf['source_model'];
+        $finp=$attrinf['frontend_input'];
+        $bt=$attrinf['backend_type'];
+        $user=$attrinf['is_user_defined'];
+        //checking specific extension custom model for selects that might not respect magento default model
+        if($user==1 && $bt=='int' && $finp=='select' && isset($smodel) && $smodel!="eav/entity_attribute_source_table")
+        {
+              $this->log("Potential assignment problem, specific model found for select attribute => ".$attrinf['attribute_code']."($smodel)","warning");
+        }
+
+    }
     /**
      *
      * gets attribute metadata from DB and put it in attribute metadata caches
@@ -364,11 +374,11 @@ class Magmi_ProductImportEngine extends Magmi_Engine
             $qcolstr = $this->arr2values($toscan);
             
             $tname = $this->tablename("eav_attribute");
-            if ($this->getMagentoVersion() != "1.3.x")
+            if ($this->checkMagentoVersion("1.3.x", "!="))
             {
                 $extra = $this->tablename("catalog_eav_attribute");
                 // SQL for selecting attribute properties for all wanted attributes
-                $sql = "SELECT `$tname`.*,$extra.is_global,$extra.apply_to FROM `$tname`
+                $sql = "SELECT `$tname`.*,$extra.* FROM `$tname`
 				LEFT JOIN $extra ON $tname.attribute_id=$extra.attribute_id
 				WHERE  ($tname.attribute_code IN ($qcolstr)) AND (entity_type_id=?)";
             }
@@ -386,7 +396,11 @@ class Magmi_ProductImportEngine extends Magmi_Engine
                 $attrinfs[$r["attribute_code"]] = $r;
             }
             unset($result);
-            
+
+            //check specific select info with custom model
+
+
+
             // create a backend_type based array for the wanted columns
             // this will greatly help for optimizing inserts when creating attributes
             // since eav_ model for attributes has one table per backend type
@@ -403,6 +417,7 @@ class Magmi_ProductImportEngine extends Magmi_Engine
                     $this->attrbytype[$bt]["data"][] = $a;
                     $this->attrinfo[$k] = $a;
                 }
+                $this->checkAttributeInfo($a);
             }
             // now add a fast index in the attrbytype array to store id list in a comma separated form
             foreach ($this->attrbytype as $bt => $test)
@@ -537,22 +552,31 @@ class Magmi_ProductImportEngine extends Magmi_Engine
      *            : value to get option id for
      * @return : array of lines (should be as much as values found),"opvd"=>option_id for value on store 0,"opvs" option id for value on current store
      */
-    public function getOptionsFromValues($attid, $store_id, $optvals)
+    public function getOptionsFromValues($attid, $store_id, $optvals=null)
     {
-        $ovstr = substr(str_repeat("?,", count($optvals)), 0, -1);
+        //add support for passing no values,returning all optionid/value tuples
+        if($optvals!=null) {
+            $ovstr = substr(str_repeat("?,", count($optvals)), 0, -1);
+            $extra ="AND BINARY optvals.value IN($ovstr)";
+        }
+        else
+        {
+            $optvals=array();
+            $extra='';
+        }
         $t1 = $this->tablename('eav_attribute_option');
         $t2 = $this->tablename('eav_attribute_option_value');
-        $sql = "SELECT optvals.option_id as opvs,optvals.value FROM $t2 as optvals";
+        $sql = "SELECT optvals.option_id as opvs,optvals.value,opt.sort_order FROM $t2 as optvals";
         $sql .= " JOIN $t1 as opt ON opt.option_id=optvals.option_id AND opt.attribute_id=?";
-        $sql .= " WHERE optvals.store_id=? AND BINARY optvals.value IN  ($ovstr)";
+        $sql .= " WHERE optvals.store_id=? $extra";
         return $this->selectAll($sql, array_merge(array($attid,$store_id), $optvals));
     }
     
     /* create a new option entry for an attribute */
-    public function createOption($attid)
+    public function createOption($attid,$pos=0)
     {
         $t = $this->tablename('eav_attribute_option');
-        $optid = $this->insert("INSERT INTO $t (attribute_id) VALUES (?)", $attid);
+        $optid = $this->insert("INSERT INTO $t (attribute_id,sort_order) VALUES (?,?)", array($attid,$pos));
         return $optid;
     }
 
@@ -570,11 +594,26 @@ class Magmi_ProductImportEngine extends Magmi_Engine
     public function createOptionValue($optid, $store_id, $optval)
     {
         $t = $this->tablename('eav_attribute_option_value');
-        $optval_id = $this->insert("INSERT INTO $t (option_id,store_id,value) VALUES (?,?,?)", 
-            array($optid,$store_id,$optval));
+        $optval_id = $this->selectone("SELECT value_id FROM $t WHERE option_id=? AND store_id=?", array($optid,$store_id), "value_id");
+        if (!$optval_id)
+        {
+            $optval_id = $this->insert("INSERT INTO $t (option_id,store_id,value) VALUES (?,?,?)", 
+                array($optid,$store_id,$optval));
+        }
+        
         return $optval_id;
     }
 
+    /**
+     * updates option positioning
+     * @param $optid option id
+     * @param $newpos new position
+     */
+    public function updateOptPos($optid,$newpos)
+    {
+        $t = $this->tablename('eav_attribute_option');
+        $this->update("UPDATE $t SET sort_order=? WHERE option_id=?",array($newpos,$optid));
+    }
     /**
      * Returns option ids for a given store for a set of values (for select/multiselect attributes)
      * - Create new entries if values do not exist
@@ -591,10 +630,25 @@ class Magmi_ProductImportEngine extends Magmi_Engine
     {
         $svalues = array(); // store specific values
         $avalues = array(); // default (admin) values
-        
-        // Checking if we want to "translate" values existing in admin
-        foreach ($values as $val)
+        $pvalues=array();
+
+        for($i=0;$i<count($values);$i++)
         {
+            //if a position is defined for the option, memorize it
+            $pvals=explode("||",$values[$i]);
+            if(count($pvals)>1)
+            {
+                $pval=trim($pvals[1]);
+                if($pval!="") {
+                    $pvalues[] = intval($pval);
+                }
+            }
+            else
+            {
+                $pvalues[]=-1;
+            }
+            $val=$pvals[0];
+
             // if we have a reference value in admin
             if (preg_match("|^(.*)::\[(.*)\]$|", $val, $matches))
             {
@@ -610,93 +664,104 @@ class Magmi_ProductImportEngine extends Magmi_Engine
                 $avalues[] = $val;
             }
         }
-        
+        $cval=count($values);
         // get Existing options for admin values & current attribute (store = 0)
         // this array contains two items:
         //    'opvs' => the option id;
         //    'value' => the corresponding admin value
-        $optExisting = $this->getCachedOptIds($attid);
-        if (count($optExisting) == 0) {
-            $optExisting = $this->getOptionsFromValues($attid, 0, $avalues);
-        }
-        // get the values as array
-        $exvalsAdmin = array();
-        foreach ($optExisting as $optdesc) {
-            $exvalsAdmin[] = $optdesc["value"];
-        }
-        // new option values are option values that are in "admin" option values array ($avalues)
-        // and not in EXISTING admin option values array ($exvalsAdmin)
-        $newAdminValues = array_diff($avalues, $exvalsAdmin);
-
-        // foreach new admin option value we create a new option and a new
-        // option value (in admin store).
-        foreach ($newAdminValues as $nval)
+        $optAdmin = $this->getCachedOpts($attid,0);
+        //for all defined values
+        for($i=0;$i<$cval;$i++)
         {
-            // create a new option with value
-            $row = array("opvs"=>$this->createOption($attid),"value"=>$nval);
-            // add an option value for admin store
-            $this->createOptionValue($row["opvs"], $storeid, $nval);
-            // add this value to existing pool
-            $optExisting[] = $row;
-        }
-        // put this value in the option id cache
-        $this->cacheOptIds($attid, $optExisting);
-
-        // if we are on a specific store (not admin), we need to create store
-        // specific values if they do not exist yet.
-        if ($storeid != 0) {
-            $existingStoreValues = $this->getOptionsFromValues($attid, $storeid, $svalues);
-            foreach ($svalues as $inx => $storeValue) {
-                $adminValue = $avalues[$inx];
-                $optionId = null;
-                foreach ($optExisting as $optRow) {
-                    if ($adminValue == $optRow["value"]) {
-                        // this is the option id to which we have to attach the store specific value
-                        $optionId = $optRow["opvs"];
-                        break;
-                    }
-                }
-                if (is_null($optionId)) {
-                    continue; // no match, something went wrong...
-                }
-                $valueExistsAlready = false;
-                foreach ($existingStoreValues as $existingValue) {
-                    if ($existingValue['opvs'] == $optionId && $existingValue['value'] == $svalues[$inx]) {
-                        $valueExistsAlready = true;
-                    }
-                }
-                if (!$valueExistsAlready) {
-                    $this->createOptionValue($optionId, $storeid, $svalues[$inx]);
+            $pos=$pvalues[$i];
+            //if not existing in cache,create it
+            if(!isset($optAdmin[$avalues[$i]]))
+            {
+                //if no position set, default to 0
+                $xpos=$pos==-1?0:$pos;
+                //create new option entry
+                $newoptid = $this->createOption($attid,$xpos);
+                $this->createOptionValue($newoptid, 0,$avalues[$i]);
+                //cache new created one
+                $this->cacheOpt($attid, 0, $newoptid, $avalues[$i],$xpos);
+            }
+            //else check for position change
+            else{
+                $curopt=$optAdmin[$avalues[$i]];
+                if($pos!=-1 && $pos!=$curopt[1])
+                {
+                    $this->updateOptPos($curopt[0],$pvalues[$i]);
+                    $this->cacheOpt($attid, 0, $curopt[0], $avalues[$i],$pos);
                 }
             }
         }
-        
-        $optids = array();
-        // now all options are in existing & values are created
-        // builf and array with all option ids
-        foreach ($optExisting as $row)
+
+        //operating on store values
+        if($storeid!=0)
         {
-            $optids[] = $row["opvs"];
+            $optExisting=$this->getCachedOpts($attid,$storeid);
+            //iterating on store values
+            for($i=0;$i<$cval;$i++)
+            {
+                //if missing
+                if(!isset($optExisting[$svalues[$i]]))
+                {
+                    //get option id from admin
+                  $opt=$this->getCachedOpt($attid,0,$avalues[$i]);
+                  if ($avalues[$i] !== $svalues[$i]) {
+                      $this->createOptionValue($opt[0],$storeid,$svalues[$i]);
+                  }
+                  $this->cacheOpt($attid,$storeid,$opt[0],$svalues[$i],$opt[1]);
+
+                }
+            }
         }
+
+        //now we have the full cache in optExisting, just take wanted values from it
+        for($i=0;$i<$cval;$i++)
+        {
+            $av=$avalues[$i];
+            $opt=$this->getCachedOpt($attid,0,$av);
+            $optids[$av]=$opt[0];
+        }
+
+
         // remove existing store values
-        unset($existingStoreValues);
+        unset($optExisting);
         // remove existing values
-        unset($exvalsAdmin);
+        unset($optAdmin);
         // return option ids
         return $optids;
     }
 
+
     /**
-     * Adds a new option definition row in the cache
-     * 
-     * @param unknown $attid
-     *            attribute id
-     * @param unknown $row
-     *            option definition
+     * Cache an option definition
+     * @param $attid attribute id
+     * @param $storeid store id
+     * @param $optid option id
+     * @param $val value for option
+     * @param int $pos position for option
      */
-    public function cacheOptIds($attid, $row)
+    public function cacheOpt($attid,$storeid,$optid,$val,$pos=0)
     {
-        $this->_optidcache[$attid] = $row;
+        $akey="a$attid";
+        $skey="s$storeid";
+        $this->_optidcache[$akey][$skey][$val]=array($optid,$pos);
+    }
+
+    /**
+     * Retrieve a cache entry for option
+     * @param $attid attribute id
+     * @param $storeid store id
+     * @param $val value to get option id
+     * @return mixed cache entry for option (array with value=>array(option_id,position)
+     */
+    public function getCachedOpt($attid,$storeid,$val)
+    {
+        $akey="a$attid";
+        $skey="s$storeid";
+        return $this->_optidcache[$akey][$skey][$val];
     }
 
     /**
@@ -706,16 +771,25 @@ class Magmi_ProductImportEngine extends Magmi_Engine
      *            attribute id
      * @return NULL or option definition rows found
      */
-    public function getCachedOptIds($attid)
+    public function getCachedOpts($attid,$storeid=0)
     {
-        if (isset($this->_optidcache[$attid]))
-        {
-            return $this->_optidcache[$attid];
+        $akey="a$attid";
+        $skey="s$storeid";
+        if (!isset($this->_optidcache[$akey])) {
+            $this->_optidcache[$akey] = array();
         }
-        else
+        if(!isset($this->_optidcache[$akey][$skey]))
         {
-            return null;
+           $this->_optidcache[$akey][$skey] = array();
+           //initialize cache with all existing values
+           $exvals = $this->getOptionsFromValues($attid, $storeid);
+           foreach ($exvals as $optdesc)
+           {
+                $this->cacheOpt($attid,$storeid,$optdesc['opvs'],$optdesc['value'],$optdesc['sort_order']);
+           }
         }
+
+        return $this->_optidcache[$akey][$skey];
     }
 
     /**
@@ -797,6 +871,87 @@ class Magmi_ProductImportEngine extends Magmi_Engine
     }
 
     /**
+     * Optimized attribute handler resolution
+     * @param $item
+     * @param $attinfo
+     */
+    public function getHandlers($attrdesc)
+    {
+        $attrcode=$attrdesc['attribute_code'];
+        $atype=$attrdesc['backend_type'];
+        // use reflection to find special handlers
+        $typehandler = "handle" . ucfirst($atype) . "Attribute";
+        $atthandler = "handle" . ucfirst($attrcode) . "Attribute";
+        $handlers=array();
+        if(!in_array($attrcode,$this->_handlercache))
+        {
+            foreach ($this->_attributehandlers as $match => $ah)
+            {
+                $matchinfo = explode(":", $match);
+                $mtype = $matchinfo[0];
+                $mtest = $matchinfo[1];
+                unset($matchinfo);
+                if (preg_match("/$mtest/", $attrdesc[$mtype])) {
+                    // if there is a specific handler for attribute, use it
+                    if (method_exists($ah, $atthandler)) {
+                        $handlers[] = array($ah,$atthandler);
+                    }
+                    else
+                        // use generic type attribute
+                        if (method_exists($ah, $typehandler)) {
+                            $handlers[] = array($ah,$typehandler);
+                        }
+                }
+            }
+            $this->_handlercache[$attrcode]=$handlers;
+            unset($handlers);
+        }
+        return $this->_handlercache[$attrcode];
+
+
+    }
+
+    /**
+     * Filter attribute map with item data
+     * @param $attmap attribute map to filter
+     * @param $item item to match
+     * @param $itemids item identifiers
+     * @return array filtered attribute map that matches item data
+     */
+    public function filterAttributeMap($attmap,$item,$itemids)
+    {
+        $fmap=array();
+        //code not optimized to keep php 5.2.x compat, to review with maybe dynamic inclusion
+        foreach ($attmap as $tp => $a) {
+            if($tp=="static")
+            {
+                continue;
+            }
+            foreach($a["data"] as $attrdesc)
+            {
+                if ($attrdesc["apply_to"] != null &&
+                                    strpos($attrdesc["apply_to"], strtolower($itemids["type"])) === false)
+                {
+                      // do not handle attribute if it does not apply to the product type
+                       continue;
+                }
+                $attrcode = $attrdesc["attribute_code"];
+                // if the attribute code is no more in item (plugins may have come into the way), continue
+                if (!in_array($attrcode, array_keys($item)))
+                {
+                                  continue;
+                }
+                if(!isset($fmap[$tp]))
+                {
+                    $fmap[$tp]=array("data"=>array());
+                }
+                $fmap[$tp]["data"][]=$attrdesc;
+            }
+        }
+        return $fmap;
+    }
+
+    /**
      * Create product attribute from values for a given product id
      *
      * @param $pid :
@@ -812,13 +967,14 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         $this->_extra_attrs = array();
         /* now is the interesring part */
 		/* iterate on attribute backend type index */
-		foreach ($attmap as $tp => $a)
+        $fmap=$this->filterAttributeMap($attmap,$item,$itemids);
+		foreach ($fmap as $tp => $a)
         {
             /* for static types, do not insert into attribute tables */
-            if ($tp == "static")
+           /* if ($tp == "static")
             {
                 continue;
-            }
+            }*/
             
             // table name for backend type data
             $cpet = $this->tablename("catalog_product_entity_$tp");
@@ -829,92 +985,81 @@ class Magmi_ProductImportEngine extends Magmi_Engine
             // deletes to perform on backend type eav
             $deletes = array();
             
-            // use reflection to find special handlers
-            $typehandler = "handle" . ucfirst($tp) . "Attribute";
+
             // iterate on all attribute descriptions for the given backend type
             foreach ($a["data"] as $attrdesc)
             {
                 // check item type is compatible with attribute apply_to
-                if ($attrdesc["apply_to"] != null &&
+                /*if ($attrdesc["apply_to"] != null &&
                      strpos($attrdesc["apply_to"], strtolower($itemids["type"])) === false)
                 {
                     // do not handle attribute if it does not apply to the product type
                     continue;
-                }
+                }*/
                 // get attribute id
                 $attid = $attrdesc["attribute_id"];
                 // get attribute value in the item to insert based on code
-                $atthandler = "handle" . ucfirst($attrdesc["attribute_code"]) . "Attribute";
+
                 $attrcode = $attrdesc["attribute_code"];
+
                 // if the attribute code is no more in item (plugins may have come into the way), continue
-                if (!in_array($attrcode, array_keys($item)))
+                /*if (!in_array($attrcode, array_keys($item)))
                 {
                     continue;
-                }
+                }*/
                 // get the item value
                 $ivalue = $item[$attrcode];
                 // get item store id for the current attribute
-                $store_ids = $this->getItemStoreIds($item, $attrdesc["is_global"]);
+                //if is global then , global scope applies but if configurable, back to store view scope since
+                //it's a select
+                $scope=$attrdesc["is_global"];
+                $scope=$scope>0?$scope-$attrdesc["is_configurable"]:0;
+                $store_ids = $this->getItemStoreIds($item, $scope);
                 
                 // do not handle empty generic int values in create mode
                 if ($ivalue == "" && $this->mode != "update" && $tp == "int")
                 {
                     continue;
                 }
+                //attribute handler for attribute
+                $handlers=$this->getHandlers($attrdesc);
+
                 // for all store ids
                 foreach ($store_ids as $store_id)
                 {
                     
                     // base output value to be inserted = base source value
                     $ovalue = $ivalue;
-                    // check for attribute handlers for current attribute
-                    foreach ($this->_attributehandlers as $match => $ah)
+                    //iterate on available handlers until one gives a proper value
+                    for($i=0;$i<count($handlers);$i++)
                     {
-                        $matchinfo = explode(":", $match);
-                        $mtype = $matchinfo[0];
-                        $mtest = $matchinfo[1];
-                        unset($matchinfo);
-                        unset($hvalue);
-                        if (preg_match("/$mtest/", $attrdesc[$mtype]))
+                        //get handler info array for current handler (handler instance & callback name)
+                        list($hdl,$cb)=$handlers[$i];
+                        //call appropriate callback on current handler to get return value to insert in DB
+                        $hvalue=$hdl->$cb($pid, $item, $store_id, $attrcode, $attrdesc, $ivalue);
+                        //if valid value returned, take it as output value & break
+                        if (isset($hvalue) && $hvalue != '__MAGMI_UNHANDLED__')
                         {
-                            // if there is a specific handler for attribute, use it
-                            if (method_exists($ah, $atthandler))
-                            {
-                                $hvalue = $ah->$atthandler($pid, $item, $store_id, $attrcode, $attrdesc, $ivalue);
-                            }
-                            else 
-                                // use generic type attribute
-                                if (method_exists($ah, $typehandler))
-                                {
-                                    $hvalue = $ah->$typehandler($pid, $item, $store_id, $attrcode, $attrdesc, $ivalue);
-                                }
-                            // if handlers returned a value that is not "__MAGMI_UNHANDLED__" , we have our output value
-                            if (isset($hvalue) && $hvalue != "__MAGMI_UNHANDLED__")
-                            {
-                                $ovalue = $hvalue;
-                                break;
-                            }
+                            $ovalue = $hvalue;
+                            break;
                         }
                     }
-                    // if __MAGMI_UNHANDLED__ ,don't insert anything
-                    if ($ovalue == "__MAGMI_UNHANDLED__")
+
+                    // if __MAGMI_UNHANDLED__ ,don't insert anything, __MAGMI_IGNORE__ has also to do nothing
+                    if ($ovalue == '__MAGMI_UNHANDLED__' || $ovalue=='__MAGMI_IGNORE__')
                     {
                         $ovalue = false;
                     }
                     
-                    // force null value => to delete
-                    if ($ovalue == "__NULL__")
-                    {
-                        $ovalue = "__MAGMI_DELETE__";
-                    }
-                    
-                    // if handled value is a "DELETE"
-                    if ($ovalue == "__MAGMI_DELETE__")
+                    else
+                    // if handled value is a "DELETE" or a NULL , which will also be removed
+                    if ($ovalue == '__MAGMI_DELETE__' || $ovalue=='__NULL__')
                     {
                         $deletes[] = $attid;
                         // do not handle value in insert
                         $ovalue = null;
                     }
+
                     // if we have something to do with this value
                     if ($ovalue !== false && $ovalue != null)
                     {
@@ -985,6 +1130,7 @@ class Magmi_ProductImportEngine extends Magmi_Engine
             unset($inserts);
             unset($deletes);
         }
+        unset($fmap);
         //if new attributes are to be processed, return them
         return $this->_extra_attrs;
     }
@@ -1212,6 +1358,12 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         unset($inserts);
     }
 
+    /**
+     * Return websites for an item line, based either on websites or store column
+     * @param $item item to check
+     * @param bool $default
+     * @return mixed list of website ids for item
+     */
     public function getItemWebsites($item, $default = false)
     {
         // support for websites column if set
@@ -1282,17 +1434,25 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         $this->delete($sql, $ddata);
         $sql = "INSERT INTO `$cpst` (`product_id`, `website_id`) SELECT ?,website_id FROM $cws WHERE website_id IN ($qcolstr)";
         $this->insert($sql, array_merge(array($pid), $wsids));
-    }
+     }
 
+    /**
+     * Clears option id cache
+     */
     public function clearOptCache()
     {
-        unset($this->_optidcache);
-        $this->_optidcache = array();
+       /* unset($this->_optidcache);
+        $this->_optidcache = array();*/
     }
 
+    /**
+     * Specific processing to set internal state for new sku to import
+     * @param $sku sku to import
+     * @param $existing boolean, item existing or not
+     */
     public function onNewSku($sku, $existing)
     {
-        $this->clearOptCache();
+        //$this->clearOptCache();
         // only assign values to store 0 by default in create mode for new sku
         // for store related options
         if (!$existing)
@@ -1306,6 +1466,10 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         $this->_same = false;
     }
 
+    /**
+     * Specific processing to set internal state on repeating sku on import
+     * @param $sku repeated sku
+     */
     public function onSameSku($sku)
     {
         unset($this->_dstore);
@@ -1313,11 +1477,33 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         $this->_same = true;
     }
 
+    /**
+     * returns if item to import already exists (need item to have been identified)
+     * @return bool exists or not
+     */
     public function currentItemExists()
     {
         return $this->_curitemids["__new"] == false;
     }
 
+    /**
+     * Override of log to add sku reference
+     * @param $data raw log data
+     * @param string $type log type (may be modified by plugin)
+     * @param null $logger logger to use (null = defaul logger)
+     */
+    public function log($data,$type="info",$logger=null)
+    {
+        $prefix=((strpos($type,'warning')!==FALSE || strpos($type,'error')!==FALSE ) && isset($this->_curitemids['sku']))?"SKU ".$this->_curitemids['sku']." - " :'';
+        parent::log($prefix.$data,$type,$logger);
+    }
+
+    /**
+     * Fetches item identifiers (attribute_set, type, product id if existing)
+     * if the item does not exist, uses the data source , otherwise fetch it from magento db
+     * @param $item item to retreive ids for
+     * @return array associative array for identifiers
+     */
     public function getItemIds($item)
     {
         $sku = $item["sku"];
@@ -1348,18 +1534,21 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         return $this->_curitemids;
     }
 
+    //more efficient filtering for handleIgnore
+    public function keepValue($v)
+    {
+        return $v!=='__MAGMI_IGNORE__';
+    }
+    //more efficient handleIgnore
     public function handleIgnore(&$item)
     {
-        // filter __MAGMI_IGNORE__ COLUMNS
-        foreach ($item as $k => $v)
-        {
-            if ($v === "__MAGMI_IGNORE__")
-            {
-                unset($item[$k]);
-            }
-        }
+        $item=array_filter($item,array($this,'keepValue'));
     }
 
+    /**
+     * @param $pid product id
+     * @return string comma separated list of stores for item id
+     */
     public function findItemStores($pid)
     {
         $sql = "SELECT cs.code FROM " . $this->tablename("catalog_product_website") . " AS cpw" . " JOIN " .
@@ -1514,7 +1703,7 @@ class Magmi_ProductImportEngine extends Magmi_Engine
             
             if (!$this->checkstore($item, $pid, $isnew))
             {
-                $this->log("invalid store value, skipping item sku:" . $item["sku"]);
+                $this->log("invalid store value, skipping item");
                 return false;
             }
             // if column list has been modified by callback, update attribute info cache.
@@ -1538,13 +1727,11 @@ class Magmi_ProductImportEngine extends Magmi_Engine
             {
                 $this->updateWebSites($pid, $item);
             }
-            
-            if (!$this->_same)
-            {
-                // update stock
-                $this->updateStock($pid, $item, $isnew);
-            }
-            
+
+            //fix for multiple stock update
+            //always update stock
+            $this->updateStock($pid, $item, $isnew);
+
             $this->touchProduct($pid);
             // ok,we're done
             if (!$this->callPlugins("itemprocessors", "processItemAfterImport", $item, $fullmeta))
@@ -1586,6 +1773,11 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         return $count;
     }
 
+    /**
+     * Update raw product data in magento (catalog_product_entity fields)
+     * @param $item data to update
+     * @param $pid product id
+     */
     public function updateProduct($item, $pid)
     {
         $tname = $this->tablename('catalog_product_entity');
@@ -1603,11 +1795,17 @@ class Magmi_ProductImportEngine extends Magmi_Engine
         $this->update($sql, array_merge(array_values($values), array($pid)));
     }
 
+    /**
+     * @return mixed product entity type
+     */
     public function getProductEntityType()
     {
         return $this->prod_etype;
     }
 
+    /**
+     * @return mixed current importing row
+     */
     public function getCurrentRow()
     {
         return $this->_current_row;
